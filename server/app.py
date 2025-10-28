@@ -11,7 +11,7 @@ import pandas as pd
 import pdfplumber
 from dateutil import parser as dateparser
 from fastapi import FastAPI, Depends, UploadFile, File, Form
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 # --- our auth / db / config / forecast glue ---
@@ -174,7 +174,6 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def on_startup():
-    # create tables (users)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
@@ -187,6 +186,7 @@ app.include_router(fastapi_users.get_users_router(UserRead, UserUpdate), prefix=
 @app.get("/")
 def root_health():
     return {"ok": True}
+
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
@@ -298,7 +298,7 @@ def parse_pdf_transactions(pdf_bytes: bytes) -> pd.DataFrame:
             return False
         if re.search(r"[.,]", t) or re.search(r"(?:DR|CR)", t, re.IGNORECASE) or "(" in t or ")" in t:
             return True
-        return abs(val) >= 100  # filter accidental '1', '2', etc.
+        return abs(val) >= 100
 
     def looks_header(desc: str) -> bool:
         s = (desc or "").lower().strip()
@@ -359,7 +359,6 @@ def parse_pdf_transactions(pdf_bytes: bytes) -> pd.DataFrame:
             )
             rows = cluster_rows(words, y_tol=3.2)
             for toks in rows:
-                # leftmost date in first few tokens
                 date_i = None
                 for i, t in enumerate(toks[:6]):
                     if is_date(t["text"]):
@@ -375,7 +374,6 @@ def parse_pdf_transactions(pdf_bytes: bytes) -> pd.DataFrame:
                 if amount is None:
                     continue
 
-                # Description = all non-date, non-money tokens
                 desc_tokens = [
                     t for i, t in enumerate(toks)
                     if i != date_i and i not in money_set and not is_date(t["text"]) and not is_money(t["text"])
@@ -385,7 +383,6 @@ def parse_pdf_transactions(pdf_bytes: bytes) -> pd.DataFrame:
                 desc = re.sub(r"\s+", " ", desc).strip()
 
                 if not desc:
-                    # fallback: slice between date and first/rightmost money x-range
                     last_money_x = max((toks[i]["x0"] for i in money_set), default=toks[-1]["x0"])
                     date_x1 = toks[date_i]["x1"]
                     mid = [
@@ -509,7 +506,6 @@ def normalize_to_canonical(df_raw: pd.DataFrame) -> pd.DataFrame:
 
     out = df[["date", "desc", "amount"]].dropna(subset=["date", "desc", "amount"])
 
-    # drop numeric-only desc or zero-amount artifacts
     mask_numeric_desc = out["desc"].str.fullmatch(r"[0\s.,()DRCR-]+", case=False, na=False)
     mask_zero_amt = out["amount"].fillna(0).eq(0)
     out = out[~(mask_numeric_desc | mask_zero_amt)]
@@ -528,7 +524,7 @@ def user_paths_for(uid: str):
     }
 
 # =============================================================================
-# API
+# API: Upload, Correct, Forecast
 # =============================================================================
 
 @app.post("/classify/upload")
@@ -578,6 +574,10 @@ async def classify_upload(
 
     out = add_guesses(df)
     needs = out[out["guess"].isin(["", "Other"])].head(20).to_dict(orient="records")
+
+    # (Optional) persist a snapshot per user for debugging
+    p = user_paths_for(str(user.id))
+    (p["root"] / "LastPreview.csv").write_text(out.to_csv(index=False), encoding="utf-8")
 
     return {
         "preview": out.head(100).to_dict(orient="records"),
@@ -640,3 +640,126 @@ def run_forecast(
         "by_category": res.by_category,
         "total": res.total,
     }
+
+# =============================================================================
+# Minimal built-in frontend (single page, no extra files)
+# =============================================================================
+@app.get("/app", response_class=HTMLResponse)
+def app_page():
+    # Self-contained HTML + JS for: register, login (JWT), upload many PDFs, run forecast
+    return """<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BankClassify — Upload & Forecast</title>
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;line-height:1.5;margin:24px;max-width:900px}
+  h1{margin:0 0 8px}
+  .card{border:1px solid #e5e7eb;border-radius:12px;padding:16px;margin:12px 0}
+  label{display:block;margin:.5rem 0 .25rem}
+  input[type="text"],input[type="password"]{width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:8px}
+  button{padding:8px 14px;border:1px solid #4f46e5;background:#4f46e5;color:#fff;border-radius:8px;cursor:pointer}
+  button.secondary{background:#fff;color:#111827;border-color:#9ca3af}
+  pre{background:#0b1020;color:#d1e7ff;padding:12px;border-radius:8px;overflow:auto}
+  .row{display:flex;gap:12px;flex-wrap:wrap}
+  .row > *{flex:1 1 280px}
+</style>
+
+<h1>BankClassify</h1>
+<p>Register → Login → Upload PDFs/CSVs → Forecast.</p>
+
+<div class="card">
+  <h3>Auth</h3>
+  <div class="row">
+    <div>
+      <label>Email</label>
+      <input id="email" type="text" placeholder="you@example.com">
+    </div>
+    <div>
+      <label>Password</label>
+      <input id="password" type="password" placeholder="********">
+    </div>
+  </div>
+  <div class="row">
+    <button id="btnRegister">Register</button>
+    <button id="btnLogin" class="secondary">Login</button>
+    <input id="token" type="text" placeholder="Bearer token appears here after login">
+  </div>
+  <pre id="authOut"></pre>
+</div>
+
+<div class="card">
+  <h3>Upload (multiple files allowed)</h3>
+  <div class="row">
+    <input id="files" type="file" multiple>
+    <button id="btnUpload">Upload & Classify</button>
+  </div>
+  <pre id="uploadOut"></pre>
+</div>
+
+<div class="card">
+  <h3>Forecast</h3>
+  <div class="row">
+    <select id="horizon">
+      <option value="next_month">next_month</option>
+      <option value="next_week">next_week</option>
+    </select>
+    <button id="btnForecast">Run Forecast</button>
+  </div>
+  <pre id="forecastOut"></pre>
+</div>
+
+<script>
+  const authOut = document.getElementById('authOut');
+  const uploadOut = document.getElementById('uploadOut');
+  const forecastOut = document.getElementById('forecastOut');
+  const tokenEl = document.getElementById('token');
+  const emailEl = document.getElementById('email');
+  const passEl = document.getElementById('password');
+  const filesEl = document.getElementById('files');
+  const horizonEl = document.getElementById('horizon');
+
+  async function postForm(url, data, authToken) {
+    const headers = {};
+    if (authToken) headers['Authorization'] = 'Bearer ' + authToken;
+    const r = await fetch(url, { method: 'POST', headers, body: data });
+    const t = await r.text();
+    try { return [r.status, JSON.parse(t)]; } catch { return [r.status, t]; }
+  }
+
+  document.getElementById('btnRegister').onclick = async () => {
+    const body = JSON.stringify({ email: emailEl.value, password: passEl.value });
+    const r = await fetch('/auth/register', { method: 'POST', headers: {'Content-Type':'application/json'}, body });
+    const txt = await r.text();
+    authOut.textContent = 'REGISTER ' + r.status + '\\n' + txt;
+  };
+
+  document.getElementById('btnLogin').onclick = async () => {
+    const fd = new URLSearchParams();
+    fd.set('grant_type', 'password');
+    fd.set('username', emailEl.value);
+    fd.set('password', passEl.value);
+    const r = await fetch('/auth/jwt/login', { method: 'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body: fd });
+    const js = await r.json().catch(()=>null);
+    authOut.textContent = 'LOGIN ' + r.status + '\\n' + JSON.stringify(js, null, 2);
+    if (js && js.access_token) tokenEl.value = js.access_token;
+  };
+
+  document.getElementById('btnUpload').onclick = async () => {
+    const tok = tokenEl.value.trim();
+    if (!tok) { uploadOut.textContent = 'Please login first.'; return; }
+    const fd = new FormData();
+    for (const f of filesEl.files) fd.append('files', f);
+    const [code, out] = await postForm('/classify/upload', fd, tok);
+    uploadOut.textContent = 'UPLOAD ' + code + '\\n' + JSON.stringify(out, null, 2);
+  };
+
+  document.getElementById('btnForecast').onclick = async () => {
+    const tok = tokenEl.value.trim();
+    if (!tok) { forecastOut.textContent = 'Please login first.'; return; }
+    const fd = new FormData();
+    fd.set('horizon', horizonEl.value);
+    const [code, out] = await postForm('/forecast/run', fd, tok);
+    forecastOut.textContent = 'FORECAST ' + code + '\\n' + JSON.stringify(out, null, 2);
+  };
+</script>
+"""
