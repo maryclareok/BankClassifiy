@@ -1,29 +1,21 @@
 # server/app.py
 from __future__ import annotations
 
-from pathlib import Path as _Path
-from typing import Optional, List, Dict
-from uuid import UUID
-
-#from typing import List, Optional
-from fastapi import UploadFile, File, Form
-import io
-import pandas as pd
-
 import io
 import os
 import re
-# Persist user data (models, AllData.csv) under /data for Railway volumes.
-import os
 from pathlib import Path
+from typing import Optional, List, Dict
+
 import pandas as pd
-from dateutil import parser as dateparser
 import pdfplumber
-from fastapi import FastAPI, Depends, UploadFile, Form
+from dateutil import parser as dateparser
+from fastapi import FastAPI, Depends, UploadFile, File, Form
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 # --- our auth / db / config / forecast glue ---
-from server.config import USER_DATA_ROOT
+from server.config import USER_DATA_ROOT as CFG_USER_DATA_ROOT
 from server.db import engine
 from server.models import Base, User
 from server.auth import (
@@ -37,8 +29,9 @@ from server.auth import (
 from server.forecast import forecast_next_period
 
 # =============================================================================
-# Repo-backed classifier integration (your original logic kept intact)
+# Repo-backed classifier integration (kept)
 # =============================================================================
+from pathlib import Path as _Path
 REPO_CLASSIFIER = None
 CATEGORIES_PATHS = [
     _Path("categories.txt"),
@@ -59,17 +52,12 @@ def _load_categories_txt() -> list[str]:
     return []
 
 def _try_make_repo_classifier():
-    """
-    Returns a callable: (text:str) -> str using the repo if possible,
-    else None (caller will use heuristics).
-    """
+    """Return callable (text:str)->str using local repo if available, else None."""
     cat_list = _load_categories_txt()
     if not cat_list:
         return None
-
     try:
         import importlib
-        # Prefer Classify.py
         mod = importlib.import_module("Classify")
     except Exception:
         try:
@@ -77,7 +65,6 @@ def _try_make_repo_classifier():
         except Exception:
             return None
 
-    # Try common function/class names
     candidate_names = [
         "classify_string", "classify", "classifyText", "classify_text",
         "Classify", "ClassifyLine", "predict_category", "predict"
@@ -166,11 +153,11 @@ def add_guesses(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 # =============================================================================
-# App & Auth routes
+# App & Auth
 # =============================================================================
-app = FastAPI(title="BankClassify API (Auth + PDF + Forecast)")
-from fastapi.middleware.cors import CORSMiddleware
+app = FastAPI(title="BankClassify API (Auth + PDF + Forecast)", version="0.1.0")
 
+# CORS (loose for dev; restrict for prod)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -178,7 +165,7 @@ app.add_middleware(
         "http://localhost:8000",
         "http://127.0.0.1:3000",
         "http://localhost:3000",
-        "*"  # loosened for dev; restrict in prod
+        "*"  # tighten later
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -191,29 +178,23 @@ async def on_startup():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-# FastAPI Users (JWT login/register/users)
-app.include_router(
-    fastapi_users.get_auth_router(auth_backend),
-    prefix="/auth/jwt",
-    tags=["auth"],
-)
-app.include_router(
-    fastapi_users.get_register_router(UserRead, UserCreate),
-    prefix="/auth",
-    tags=["auth"],
-)
-app.include_router(
-    fastapi_users.get_users_router(UserRead, UserUpdate),
-    prefix="/users",
-    tags=["users"],
-)
+# Auth routes
+app.include_router(fastapi_users.get_auth_router(auth_backend), prefix="/auth/jwt", tags=["auth"])
+app.include_router(fastapi_users.get_register_router(UserRead, UserCreate), prefix="/auth", tags=["auth"])
+app.include_router(fastapi_users.get_users_router(UserRead, UserUpdate), prefix="/users", tags=["users"])
+
+# Health
+@app.get("/")
+def root_health():
+    return {"ok": True}
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
 
 # =============================================================================
 # Storage / constants
 # =============================================================================
-
-
-DATA_ROOT = Path(os.getenv("USER_DATA_ROOT", "/data/models")).resolve()
+DATA_ROOT = Path(os.getenv("USER_DATA_ROOT", CFG_USER_DATA_ROOT)).resolve()
 DATA_ROOT.mkdir(parents=True, exist_ok=True)
 
 MONEY_RE = r"\(?[₦$€£]?\s?\d[\d,]*\.?\d{0,2}\)?(?:\s*(?:DR|CR))?"
@@ -242,17 +223,21 @@ PERIOD_ONLY = re.compile(
 # Helpers: amounts & dates & text cleanup
 # =============================================================================
 def parse_amount(s: str) -> Optional[float]:
-    if s is None: return None
+    if s is None:
+        return None
     t = str(s).strip()
-    if not t: return None
+    if not t:
+        return None
     t_clean = re.sub(r"[₦$€£,\s]", "", t)
     neg = False
     if t_clean.upper().endswith("DR"):
-        neg = True; t_clean = t_clean[:-2]
+        neg = True
+        t_clean = t_clean[:-2]
     elif t_clean.upper().endswith("CR"):
         t_clean = t_clean[:-2]
     if re.match(r"^\(.*\)$", t):
-        neg = True; t_clean = t_clean.strip("()")
+        neg = True
+        t_clean = t_clean.strip("()")
     try:
         v = float(t_clean)
         return -v if neg else v
@@ -260,7 +245,8 @@ def parse_amount(s: str) -> Optional[float]:
         return None
 
 def smart_parse_date(s: str):
-    if not s or not str(s).strip(): return None
+    if not s or not str(s).strip():
+        return None
     try:
         dt = dateparser.parse(str(s), dayfirst=True, fuzzy=True)
         return pd.to_datetime(dt).date() if dt else None
@@ -268,14 +254,17 @@ def smart_parse_date(s: str):
         return None
 
 def strip_date_tokens(text: str) -> str:
-    if not text: return ""
+    if not text:
+        return ""
     text = re.sub(r"^\s*"+DATE_RE+r"\s+", "", text)
     text = re.sub(r"\b(\d{1,2}[-/ ]?[A-Za-z]{3,9}[-/ ]?\d{2,4})\b", "", text)
     return re.sub(r"\s+", " ", text).strip()
 
 def strip_trailing_money_tokens(text: str) -> str:
-    if not text: return ""
-    prev = None; cur = text
+    if not text:
+        return ""
+    prev = None
+    cur = text
     while prev != cur:
         prev = cur
         cur = re.sub(r"\s*"+MONEY_RE+r"\s*$", "", cur).rstrip()
@@ -291,7 +280,7 @@ def normalize_periodish_desc(desc: str) -> str:
     return desc
 
 # =============================================================================
-# PDF geometry parser (your original, preserved)
+# PDF geometry parser
 # =============================================================================
 def parse_pdf_transactions(pdf_bytes: bytes) -> pd.DataFrame:
     date_full  = re.compile(r"^\s*"+DATE_RE+r"\s*$")
@@ -313,7 +302,8 @@ def parse_pdf_transactions(pdf_bytes: bytes) -> pd.DataFrame:
 
     def looks_header(desc: str) -> bool:
         s = (desc or "").lower().strip()
-        if not s: return False
+        if not s:
+            return False
         for pat in HEADER_DROP_PATTERNS:
             if re.search(pat, s):
                 return True
@@ -331,16 +321,20 @@ def parse_pdf_transactions(pdf_bytes: bytes) -> pd.DataFrame:
             for row in rows:
                 rymid = row[0]["_ymid"]
                 if abs(ymid - rymid) <= y_tol:
-                    row.append({**w, "_ymid": ymid}); placed = True; break
+                    row.append({**w, "_ymid": ymid})
+                    placed = True
+                    break
             if not placed:
                 rows.append([{**w, "_ymid": ymid}])
         rows.sort(key=lambda r: r[0]["_ymid"])
-        for r in rows: r.sort(key=lambda w: w["x0"])
+        for r in rows:
+            r.sort(key=lambda w: w["x0"])
         return rows
 
     def compute_amount_and_money_indices(tokens: List[Dict]):
-        money_idx = [i for i,t in enumerate(tokens) if is_money(t["text"])]
-        if not money_idx: return None, set()
+        money_idx = [i for i, t in enumerate(tokens) if is_money(t["text"])]
+        if not money_idx:
+            return None, set()
         money_idx.sort(key=lambda i: tokens[i]["x0"])
         keep = money_idx[-3:]  # up to debit, credit, balance
         keep.sort(key=lambda i: tokens[i]["x0"])
@@ -369,7 +363,8 @@ def parse_pdf_transactions(pdf_bytes: bytes) -> pd.DataFrame:
                 date_i = None
                 for i, t in enumerate(toks[:6]):
                     if is_date(t["text"]):
-                        date_i = i; break
+                        date_i = i
+                        break
                 if date_i is None:
                     continue
                 date_str = toks[date_i]["text"].strip()
@@ -382,7 +377,7 @@ def parse_pdf_transactions(pdf_bytes: bytes) -> pd.DataFrame:
 
                 # Description = all non-date, non-money tokens
                 desc_tokens = [
-                    t for i,t in enumerate(toks)
+                    t for i, t in enumerate(toks)
                     if i != date_i and i not in money_set and not is_date(t["text"]) and not is_money(t["text"])
                 ]
                 desc = " ".join(t["text"] for t in desc_tokens)
@@ -394,7 +389,7 @@ def parse_pdf_transactions(pdf_bytes: bytes) -> pd.DataFrame:
                     last_money_x = max((toks[i]["x0"] for i in money_set), default=toks[-1]["x0"])
                     date_x1 = toks[date_i]["x1"]
                     mid = [
-                        t for i,t in enumerate(toks)
+                        t for i, t in enumerate(toks)
                         if (t["x0"] >= date_x1 - 1.0 and t["x1"] <= last_money_x + 0.5 and i not in money_set and i != date_i)
                     ]
                     desc = " ".join(t["text"] for t in mid)
@@ -419,31 +414,43 @@ def parse_pdf_transactions(pdf_bytes: bytes) -> pd.DataFrame:
         for page in pdf2.pages:
             tables = page.extract_tables() or []
             for tb in tables:
-                if not tb or len(tb) < 2: continue
+                if not tb or len(tb) < 2:
+                    continue
                 header = [(h.strip() if isinstance(h, str) else "") for h in tb[0]]
-                body   = tb[1:]
+                body = tb[1:]
                 idx = {"date": None, "desc": None, "debit": None, "credit": None, "amount": None}
-                for i,h in enumerate(header):
+                for i, h in enumerate(header):
                     hl = h.lower()
-                    if "date" in hl and idx["date"] is None: idx["date"] = i
-                    elif any(k in hl for k in ["description","details","narration","particular"]): idx["desc"]=i
-                    elif hl=="debit": idx["debit"]=i
-                    elif hl=="credit": idx["credit"]=i
-                    elif "amount" in hl: idx["amount"]=i
-                if idx["date"] is None or all(idx[k] is None for k in ["amount","debit","credit"]):
+                    if "date" in hl and idx["date"] is None:
+                        idx["date"] = i
+                    elif any(k in hl for k in ["description", "details", "narration", "particular"]):
+                        idx["desc"] = i
+                    elif hl == "debit":
+                        idx["debit"] = i
+                    elif hl == "credit":
+                        idx["credit"] = i
+                    elif "amount" in hl:
+                        idx["amount"] = i
+                if idx["date"] is None or all(idx[k] is None for k in ["amount", "debit", "credit"]):
                     continue
                 for r in body:
-                    if not r or all(x in (None,"") for x in r): continue
-                    def get(i): return (r[i] if i is not None and i < len(r) else "") or ""
+                    if not r or all(x in (None, "") for x in r):
+                        continue
+
+                    def get(i):
+                        return (r[i] if i is not None and i < len(r) else "") or ""
+
                     dstr = str(get(idx["date"])).strip()
-                    if not smart_parse_date(dstr): continue
+                    if not smart_parse_date(dstr):
+                        continue
                     if idx["amount"] is not None:
                         aval = parse_amount(str(get(idx["amount"])))
                     else:
                         dval = parse_amount(str(get(idx["debit"]))) if idx["debit"] is not None else None
                         cval = parse_amount(str(get(idx["credit"]))) if idx["credit"] is not None else None
                         aval = (0 if cval is None else cval) - (0 if dval is None else dval)
-                    if aval is None: continue
+                    if aval is None:
+                        continue
                     desc = str(get(idx["desc"])).strip() if idx["desc"] is not None else ""
                     desc = strip_trailing_money_tokens(strip_date_tokens(desc))
                     if not desc or any(re.search(p, desc.lower()) for p in HEADER_DROP_PATTERNS):
@@ -457,34 +464,41 @@ def parse_pdf_transactions(pdf_bytes: bytes) -> pd.DataFrame:
             df = df.dropna(subset=["date", "desc"])
             return df
 
-    return pd.DataFrame(columns=["date","desc","amount"])
+    return pd.DataFrame(columns=["date", "desc", "amount"])
 
 # =============================================================================
-# CSV canonical normalization (when user uploads CSV instead of PDF)
+# CSV canonical normalization
 # =============================================================================
 def normalize_to_canonical(df_raw: pd.DataFrame) -> pd.DataFrame:
     rename = {}
     for c in df_raw.columns:
         s = str(c).strip().lower()
-        if "date" in s and "update" not in s: rename[c] = "date"
-        elif any(k in s for k in ["desc","narration","details","particular"]): rename[c] = "desc"
-        elif s == "debit": rename[c] = "Debit"
-        elif s == "credit": rename[c] = "Credit"
-        elif "amount" in s and "net" not in s: rename[c] = "amount"
-        elif "balance" in s: rename[c] = "Balance"
+        if "date" in s and "update" not in s:
+            rename[c] = "date"
+        elif any(k in s for k in ["desc", "narration", "details", "particular"]):
+            rename[c] = "desc"
+        elif s == "debit":
+            rename[c] = "Debit"
+        elif s == "credit":
+            rename[c] = "Credit"
+        elif "amount" in s and "net" not in s:
+            rename[c] = "amount"
+        elif "balance" in s:
+            rename[c] = "Balance"
     df = df_raw.rename(columns=rename).copy()
 
     if "amount" not in df.columns and ("Debit" in df.columns or "Credit" in df.columns):
-        deb = df.get("Debit", pd.Series([0]*len(df))).apply(parse_amount)
-        cred = df.get("Credit", pd.Series([0]*len(df))).apply(parse_amount)
+        deb = df.get("Debit", pd.Series([0] * len(df))).apply(parse_amount)
+        cred = df.get("Credit", pd.Series([0] * len(df))).apply(parse_amount)
         df["amount"] = (cred.fillna(0) - deb.fillna(0))
 
-    for need in ("date","desc","amount"):
-        if need not in df.columns: df[need] = None
+    for need in ("date", "desc", "amount"):
+        if need not in df.columns:
+            df[need] = None
 
-    df["date"]   = df["date"].apply(smart_parse_date)
+    df["date"] = df["date"].apply(smart_parse_date)
     df["amount"] = df["amount"].apply(parse_amount)
-    df["desc"]   = (
+    df["desc"] = (
         df["desc"].astype(str)
         .apply(strip_trailing_money_tokens)
         .apply(strip_date_tokens)
@@ -493,11 +507,11 @@ def normalize_to_canonical(df_raw: pd.DataFrame) -> pd.DataFrame:
         .str.strip()
     )
 
-    out = df[["date","desc","amount"]].dropna(subset=["date","desc","amount"])
+    out = df[["date", "desc", "amount"]].dropna(subset=["date", "desc", "amount"])
 
     # drop numeric-only desc or zero-amount artifacts
     mask_numeric_desc = out["desc"].str.fullmatch(r"[0\s.,()DRCR-]+", case=False, na=False)
-    mask_zero_amt     = out["amount"].fillna(0).eq(0)
+    mask_zero_amt = out["amount"].fillna(0).eq(0)
     out = out[~(mask_numeric_desc | mask_zero_amt)]
     return out
 
@@ -507,28 +521,26 @@ def normalize_to_canonical(df_raw: pd.DataFrame) -> pd.DataFrame:
 def user_paths_for(uid: str):
     udir = DATA_ROOT / uid
     udir.mkdir(parents=True, exist_ok=True)
-    return {"root": udir, "all_data": udir / "AllData.csv", "categories": udir / "categories.txt"}
+    return {
+        "root": udir,
+        "all_data": udir / "AllData.csv",
+        "categories": udir / "categories.txt",
+    }
 
 # =============================================================================
 # API
 # =============================================================================
-@app.get("/")
-def health():
-    return {"ok": True}
-
-# ...keep the rest of your imports and helpers...
 
 @app.post("/classify/upload")
 async def classify_upload(
-    user_id: str = Form(...),
     file: Optional[UploadFile] = File(None),
     files: Optional[List[UploadFile]] = File(None),
+    user: User = Depends(current_active_user),
 ):
     """
     Accepts one or many statements (PDF/CSV). We extract & merge all rows,
-    then return a single preview with guesses.
+    then return a single preview with guesses. Uses the authenticated user.
     """
-    # Collect the upload list
     uploads: List[UploadFile] = []
     if file is not None:
         uploads.append(file)
@@ -546,17 +558,13 @@ async def classify_upload(
 
         try:
             if name.endswith(".pdf") or (up.content_type or "").lower() == "application/pdf":
-                # Primary path: your pdfplumber geometry-aware extraction
                 df_part = parse_pdf_transactions(content)
-                # If you later add monopoly-core, you can try it first and fallback to pdfplumber.
             elif name.endswith(".csv"):
-                # Robust CSV read (uses your canonical normalizer)
                 df_part = normalize_to_canonical(pd.read_csv(io.BytesIO(content)))
             else:
-                # Default to CSV attempt if extension missing/unknown
                 df_part = normalize_to_canonical(pd.read_csv(io.BytesIO(content)))
         except Exception:
-            # Skip bad files but continue others
+            # skip a bad file but continue others
             continue
 
         if df_part is not None and not df_part.empty:
@@ -565,21 +573,17 @@ async def classify_upload(
     if not frames:
         return JSONResponse({"error": "No transactions found across uploaded files."}, status_code=422)
 
-    # Merge, drop duplicates
     df = pd.concat(frames, ignore_index=True)
     df = df.drop_duplicates(subset=["date", "desc", "amount"]).reset_index(drop=True)
 
-    # Add guesses (repo-backed or heuristics)
     out = add_guesses(df)
-
-    # Show a small “needs-review” batch: anything that wasn’t clearly classified
     needs = out[out["guess"].isin(["", "Other"])].head(20).to_dict(orient="records")
 
     return {
         "preview": out.head(100).to_dict(orient="records"),
         "review_batch": needs,
         "rows": int(len(out)),
-        "files_processed": len(frames)
+        "files_processed": len(frames),
     }
 
 @app.post("/classify/correct")
@@ -589,40 +593,37 @@ async def classify_correct(
 ):
     if not labeled_csv:
         return JSONResponse({"error": "labeled_csv missing"}, status_code=400)
-
     try:
         df_labeled = pd.read_csv(labeled_csv.file)
     except Exception as e:
         return JSONResponse({"error": f"Failed to read CSV: {e}"}, status_code=400)
 
-    # Accept either your earlier 'final_label' or a ready 'cat' column
-    cols_lower = [c.lower() for c in df_labeled.columns]
-    if "final_label" in cols_lower and "cat" not in cols_lower:
-        df_labeled.columns = [c.lower() for c in df_labeled.columns]
-        df_save = df_labeled[["date","desc","amount","final_label"]].rename(columns={"final_label":"cat"})
+    df_labeled.columns = [c.lower() for c in df_labeled.columns]
+    if "final_label" in df_labeled.columns and "cat" not in df_labeled.columns:
+        df_save = df_labeled[["date", "desc", "amount", "final_label"]].rename(columns={"final_label": "cat"})
     else:
-        df_labeled.columns = [c.lower() for c in df_labeled.columns]
-        if not {"date","desc","amount","cat"}.issubset(df_labeled.columns):
-            return JSONResponse({"error":"CSV must contain: date, desc, amount, cat (or final_label)"}, status_code=400)
-        df_save = df_labeled[["date","desc","amount","cat"]].copy()
+        need = {"date", "desc", "amount", "cat"}
+        if not need.issubset(df_labeled.columns):
+            return JSONResponse({"error": "CSV must contain: date, desc, amount, cat (or final_label)"}, status_code=400)
+        df_save = df_labeled[["date", "desc", "amount", "cat"]].copy()
 
     df_save["date"] = pd.to_datetime(df_save["date"], errors="coerce").dt.date
-    df_save = df_save.dropna(subset=["date","desc"])
+    df_save = df_save.dropna(subset=["date", "desc"])
 
     p = user_paths_for(str(user.id))
-    past = pd.read_csv(p["all_data"]) if p["all_data"].exists() else pd.DataFrame(columns=["date","desc","amount","cat"])
+    past = pd.read_csv(p["all_data"]) if p["all_data"].exists() else pd.DataFrame(columns=["date", "desc", "amount", "cat"])
     past.columns = [c.lower() for c in past.columns]
-    for c in ["date","desc","amount","cat"]:
+    for c in ["date", "desc", "amount", "cat"]:
         if c not in past.columns:
             past[c] = pd.NA
     past["date"] = pd.to_datetime(past["date"], errors="coerce").dt.date
 
-    merged = pd.concat([past[["date","desc","amount","cat"]], df_save], ignore_index=True)
-    merged = merged.drop_duplicates(subset=["date","desc","amount"], keep="last")
+    merged = pd.concat([past[["date", "desc", "amount", "cat"]], df_save], ignore_index=True)
+    merged = merged.drop_duplicates(subset=["date", "desc", "amount"], keep="last")
+    p["root"].mkdir(parents=True, exist_ok=True)
     merged.to_csv(p["all_data"], index=False)
-    return {"status":"ok","stored_rows": int(len(merged))}
+    return {"status": "ok", "stored_rows": int(len(merged))}
 
-# Forecast using user's AllData.csv
 @app.post("/forecast/run")
 def run_forecast(
     horizon: str = Form("next_month"),
@@ -630,7 +631,7 @@ def run_forecast(
 ):
     """
     horizon: "next_week" or "next_month"
-    Uses models/<user_id>/AllData.csv with the labels you've stored via /classify/correct.
+    Uses models/<user_id>/AllData.csv (persisted via /classify/correct).
     """
     res = forecast_next_period(user_id=str(user.id), horizon=horizon)
     return {
