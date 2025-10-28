@@ -2,3 +2,4 @@ pandas
 textblob
 colorama
 tabulate
+-r server/requirements.txt
