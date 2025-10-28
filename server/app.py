@@ -523,6 +523,36 @@ def user_paths_for(uid: str):
         "categories": udir / "categories.txt",
     }
 
+def _append_rows(user_id: str, df_with_guess: pd.DataFrame, label_col: str = "guess") -> int:
+    """
+    Append guessed rows to the user's AllData.csv, converting `label_col` -> `cat`,
+    skipping blanks and 'Other'. De-duplicates by (date, desc, amount).
+    """
+    p = user_paths_for(user_id)
+    p["root"].mkdir(parents=True, exist_ok=True)
+
+    keep = df_with_guess.copy()
+    keep = keep[keep[label_col].notna() & (keep[label_col] != "") & (keep[label_col] != "Other")]
+    if keep.empty:
+        return 0
+
+    keep = keep.rename(columns={label_col: "cat"})
+    keep["date"] = pd.to_datetime(keep["date"], errors="coerce").dt.date
+    keep = keep.dropna(subset=["date", "desc", "amount", "cat"])
+    keep = keep[["date", "desc", "amount", "cat"]]
+
+    past = pd.read_csv(p["all_data"]) if p["all_data"].exists() else pd.DataFrame(columns=["date","desc","amount","cat"])
+    past.columns = [c.lower() for c in past.columns]
+    for c in ["date","desc","amount","cat"]:
+        if c not in past.columns:
+            past[c] = pd.NA
+    past["date"] = pd.to_datetime(past["date"], errors="coerce").dt.date
+
+    merged = pd.concat([past[["date","desc","amount","cat"]], keep], ignore_index=True)
+    merged = merged.drop_duplicates(subset=["date","desc","amount"], keep="last")
+    merged.to_csv(p["all_data"], index=False)
+    return len(keep)
+
 # =============================================================================
 # API: Upload, Correct, Forecast
 # =============================================================================
@@ -531,11 +561,12 @@ def user_paths_for(uid: str):
 async def classify_upload(
     file: Optional[UploadFile] = File(None),
     files: Optional[List[UploadFile]] = File(None),
+    save: int = Form(0),  # NEW: 0 = preview only, 1 = persist guesses to user's AllData.csv
     user: User = Depends(current_active_user),
 ):
     """
     Accepts one or many statements (PDF/CSV). We extract & merge all rows,
-    then return a single preview with guesses. Uses the authenticated user.
+    add guesses, optionally persist to your account, and return a preview.
     """
     uploads: List[UploadFile] = []
     if file is not None:
@@ -575,15 +606,23 @@ async def classify_upload(
     out = add_guesses(df)
     needs = out[out["guess"].isin(["", "Other"])].head(20).to_dict(orient="records")
 
-    # (Optional) persist a snapshot per user for debugging
+    # Optional: persist a snapshot per user for debugging
     p = user_paths_for(str(user.id))
     (p["root"] / "LastPreview.csv").write_text(out.to_csv(index=False), encoding="utf-8")
+
+    saved = 0
+    if int(save) == 1:
+        try:
+            saved = _append_rows(str(user.id), out, label_col="guess")
+        except Exception:
+            saved = 0
 
     return {
         "preview": out.head(100).to_dict(orient="records"),
         "review_batch": needs,
         "rows": int(len(out)),
         "files_processed": len(frames),
+        "saved_rows": int(saved),
     }
 
 @app.post("/classify/correct")
@@ -631,7 +670,7 @@ def run_forecast(
 ):
     """
     horizon: "next_week" or "next_month"
-    Uses models/<user_id>/AllData.csv (persisted via /classify/correct).
+    Uses models/<user_id>/AllData.csv (persisted via upload with save=1 or /classify/correct).
     """
     res = forecast_next_period(user_id=str(user.id), horizon=horizon)
     return {
@@ -662,10 +701,12 @@ def app_page():
   pre{background:#0b1020;color:#d1e7ff;padding:12px;border-radius:8px;overflow:auto}
   .row{display:flex;gap:12px;flex-wrap:wrap}
   .row > *{flex:1 1 280px}
+  .muted{color:#6b7280}
+  #loader{display:none;margin-top:8px}
 </style>
 
 <h1>BankClassify</h1>
-<p>Register → Login → Upload PDFs/CSVs → Forecast.</p>
+<p>Register → Login → Upload PDFs/CSVs → (optional) Persist → Forecast.</p>
 
 <div class="card">
   <h3>Auth</h3>
@@ -691,7 +732,11 @@ def app_page():
   <h3>Upload (multiple files allowed)</h3>
   <div class="row">
     <input id="files" type="file" multiple>
+    <label class="muted"><input id="persist" type="checkbox"> Persist guesses to my account</label>
+  </div>
+  <div class="row">
     <button id="btnUpload">Upload & Classify</button>
+    <div id="loader">Processing…</div>
   </div>
   <pre id="uploadOut"></pre>
 </div>
@@ -717,6 +762,9 @@ def app_page():
   const passEl = document.getElementById('password');
   const filesEl = document.getElementById('files');
   const horizonEl = document.getElementById('horizon');
+  const persistEl = document.getElementById('persist');
+  const loader = document.getElementById('loader');
+  const btnUpload = document.getElementById('btnUpload');
 
   async function postForm(url, data, authToken) {
     const headers = {};
@@ -749,8 +797,20 @@ def app_page():
     if (!tok) { uploadOut.textContent = 'Please login first.'; return; }
     const fd = new FormData();
     for (const f of filesEl.files) fd.append('files', f);
-    const [code, out] = await postForm('/classify/upload', fd, tok);
-    uploadOut.textContent = 'UPLOAD ' + code + '\\n' + JSON.stringify(out, null, 2);
+    fd.set('save', persistEl.checked ? '1' : '0');
+
+    loader.style.display = 'block';
+    btnUpload.disabled = true;
+    try {
+      const [code, out] = await postForm('/classify/upload', fd, tok);
+      uploadOut.textContent = 'UPLOAD ' + code + '\\n' + JSON.stringify(out, null, 2);
+    } catch (e) {
+      console.error(e);
+      uploadOut.textContent = 'UPLOAD FAILED';
+    } finally {
+      loader.style.display = 'none';
+      btnUpload.disabled = false;
+    }
   };
 
   document.getElementById('btnForecast').onclick = async () => {
